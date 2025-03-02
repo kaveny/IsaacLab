@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import torch
+import numpy as np
 from collections.abc import Sequence
 
 from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
@@ -21,16 +22,21 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
 from isaaclab.utils.math import sample_uniform
+from isaaclab_tasks.direct.go2 import read_motion as rm
+import os
+from pathlib import Path
+
+
 
 
 @configclass
 class Go2EnvCfg(DirectRLEnvCfg):
     # env
-    episode_length_s = 5.0      # max episode length
-    # action_scale = 100.0  # [N]
+    episode_length_s = 10.0      # max episode length
     observation_space = 48       # number of observations input into NN
+    # action_scale = 100.0  # [N]
     action_space = 12            # number of actions output from NN
-    decimation = 4              # number of simulation time steps between each round of observations and actions
+    decimation = 2               # number of simulation time steps between each round of observations and actions
     state_space = 0
     
     ## AnymalCFlatEnvCfg
@@ -46,8 +52,6 @@ class Go2EnvCfg(DirectRLEnvCfg):
 
     # robot
     robot_cfg: ArticulationCfg = UNITREE_GO2_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-    # cart_dof_name = "slider_to_cart"
-    # pole_dof_name = "cart_to_pole"
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1, env_spacing=4.0, replicate_physics=True)
@@ -62,6 +66,14 @@ class Go2EnvCfg(DirectRLEnvCfg):
     # rew_scale_pole_pos = -1.0
     # rew_scale_cart_vel = -0.01
     # rew_scale_pole_vel = -0.005
+    # reward function parameters
+    
+    # imitation rewards
+    # pose_weight = 0.5
+    # velocity_weight = 0.05
+    # end_effector_weight = 0.2
+    # root_pose_weight = 0.15
+    # root_velocity_weight = 0.1
 
 
 class Go2Env(DirectRLEnv):
@@ -70,13 +82,23 @@ class Go2Env(DirectRLEnv):
     def __init__(self, cfg: Go2EnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
+
         # self._cart_dof_idx, _ = self.go2.find_joints(self.cfg.cart_dof_name)
         # self._pole_dof_idx, _ = self.go2.find_joints(self.cfg.pole_dof_name)  
         # self.action_scale = self.cfg.action_scale
 
         # self.joint_pos = self.go2.data.joint_pos
         # self.joint_vel = self.go2.data.joint_vel
-        pass
+
+        # reference motion
+        current_dir = Path(os.path.dirname(os.path.abspath(__file__))) # Get the absolute path of the current file
+        MOTION_FILE_PATH = current_dir / "trot_A1.txt" # Define the path to the motion file relative to this file
+        # read motion file
+        a1_f = rm.read_frames_from_json(MOTION_FILE_PATH)
+        # convert a1 to go2 format
+        self.go2_f = rm.convert_a1_to_go2_format(a1_f)
+        # index for the next joint position
+        self.idx = 0
 
     def _setup_scene(self):
         self.go2 = Articulation(self.cfg.robot_cfg)   # creates tensor of num_envs
@@ -102,21 +124,32 @@ class Go2Env(DirectRLEnv):
         
         # anymal c
         # self._robot.set_joint_position_target(self._processed_actions)
-        self.go2.set_joint_position_target(self.go2.data.default_joint_pos)
+        
+
+        joints, self.idx = rm.get_next_front_right_joint_position(self.go2_f, self.idx)
+        # convert np.array to tensor
+        fr_joints = torch.tensor(joints, dtype=torch.float32, device=self.device)
+        # joint ids for front right leg of go2 robot
+        fr_joint_ids = torch.tensor([1,5,9], dtype=torch.int32, device=self.device)
+        self.go2.set_joint_position_target(fr_joints, joint_ids=fr_joint_ids)
+        # joint ids for all legs of go2 robot except front right leg
+        other_joints = np.array([0,2,3,4,6,7,8,10,11], dtype=np.int32)
+        other_joint_ids = torch.tensor(other_joints, dtype=torch.int32, device=self.device)
+        self.go2.set_joint_position_target(self.go2.data.default_joint_pos[:,other_joints], joint_ids=other_joint_ids)
+
+        # print('********************************')
+        # print('type(default_joint_pos)')
+        # # print(type(self.go2.data.default_joint_pos))
+        # # print(self.go2.data.default_joint_pos.shape)
+        # # print(self.go2.data.joint_names[other_joints])
+        # # print()
+        # print('go2.data.default_joint_pos[:,other_joints]')
+        # print(self.go2.data.default_joint_pos[:,other_joints])
+        # print('********************************')
+        # print()
 
 
     def _get_observations(self) -> dict:
-        # obs = torch.cat(
-        #     (
-        #         self.joint_pos[:, self._pole_dof_idx[0]].unsqueeze(dim=1),
-        #         self.joint_vel[:, self._pole_dof_idx[0]].unsqueeze(dim=1),
-        #         self.joint_pos[:, self._cart_dof_idx[0]].unsqueeze(dim=1),
-        #         self.joint_vel[:, self._cart_dof_idx[0]].unsqueeze(dim=1),
-        #     ),
-        #     dim=-1,
-        # )
-        obs = torch.zeros((self.num_envs,48), dtype=torch.float32, device=self.device)   
-        
         # anymal_c
         # obs = torch.cat(
         #     [
@@ -134,24 +167,29 @@ class Go2Env(DirectRLEnv):
         #     ],
         #     dim=-1,
         # )
+
+        obs = torch.zeros((self.num_envs,48), dtype=torch.float32, device=self.device)   
         observations = {"policy": obs}
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
-        # total_reward = compute_rewards(
-        #     self.cfg.rew_scale_alive,
-        #     self.cfg.rew_scale_terminated,
-        #     self.cfg.rew_scale_pole_pos,
-        #     self.cfg.rew_scale_cart_vel,
-        #     self.cfg.rew_scale_pole_vel,
-        #     self.joint_pos[:, self._pole_dof_idx[0]],
-        #     self.joint_vel[:, self._pole_dof_idx[0]],
-        #     self.joint_pos[:, self._cart_dof_idx[0]],
-        #     self.joint_vel[:, self._cart_dof_idx[0]],
-        #     self.reset_terminated,
-        # )
+        # pose_reward = self._calc_reward_pose()
+        # velocity_reward = self._calc_reward_velocity()
+        # end_effector_reward = self._calc_reward_end_effector()
+        # # root_pose_reward = self._calc_reward_root_pose()
+        # # root_velocity_reward = self._calc_reward_root_velocity()
+
+        # reward =  self.pose_weight * pose_reward \
+        #         + self.velocity_weight * velocity_reward \
+        #         + self.end_effector_weight * end_effector_reward \
+        #         # + self.root_pose_weight * root_pose_reward \
+        #         # + self.root_velocity_weight * root_velocity_reward
+
+        # return reward * self.weight
+    
         total_reward = torch.zeros((self.num_envs), dtype=torch.float32, device=self.device)   
         return total_reward
+
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         # self.joint_pos = self.go2.data.joint_pos
